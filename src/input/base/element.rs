@@ -1685,6 +1685,9 @@ pub(super) struct PrepaintState {
     /// First line of inline completion (painted after cursor on same line)
     ghost_first_line: Option<ShapedLine>,
     ghost_lines_height: Pixels,
+    /// Modified by ibis inc.: the dotted underlines of the marked text (display byte ranges, thickness) and their color.
+    ime_dotted: Vec<(Range<usize>, Pixels)>,
+    ime_dotted_color: Hsla,
 }
 
 impl PrepaintState {
@@ -1930,24 +1933,42 @@ impl<M: InputModeKind> Element for TextElement<M> {
             underline: None,
             strikethrough: None,
         };
-        let marked_run = TextRun {
-            len: 0,
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: Some(UnderlineStyle {
-                thickness: px(1.),
-                color: Some(text_color),
-                wavy: false,
-            }),
-            strikethrough: None,
-        };
-
+        // Modified by ibis inc.: the lines under the clauses of the marked text as the input method says (`ime.rs`); the thin solid line
+        // for all of it when the platform says nothing.
         let ime_marked_range = ime_marked_display_range(
             &text,
             state.ime_marked_range.as_ref().map(|m| m.start..m.end),
             state.masked,
         );
+        let ime_segments: Vec<super::ime::ImeSegment> = match &ime_marked_range {
+            Some(range) if !range.is_empty() => {
+                // The bullets shown instead of masked characters have no clauses of their own: one thin solid line.
+                let (marked_text, clauses): (String, &[gpui::ImeClause]) = if state.masked {
+                    ("\u{0}".repeat(range.len()), &[])
+                } else {
+                    (text.slice(range.clone()).to_string(), &state.ime_clauses)
+                };
+                super::ime::ime_segments(&marked_text, clauses)
+                    .into_iter()
+                    .map(|mut seg| {
+                        seg.range_start += range.start;
+                        seg.range_end += range.start;
+                        seg
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let ime_split: Vec<(Range<usize>, Option<UnderlineStyle>)> = ime_segments
+            .iter()
+            .map(|seg| (seg.range(), seg.text_underline(text_color)))
+            .collect();
+        // The dotted line is painted by the input itself after the text (gpui draws only solid and wavy lines).
+        let ime_dotted: Vec<(Range<usize>, Pixels)> = ime_segments
+            .iter()
+            .filter(|seg| seg.line == gpui::ImeLine::Dotted)
+            .map(|seg| (seg.range(), seg.thickness()))
+            .collect();
 
         let runs = if let (false, Some(highlight_styles)) = (is_empty, highlight_styles) {
             let mut runs = Vec::with_capacity(highlight_styles.len() + 2);
@@ -1958,22 +1979,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     run.color = run.color.opacity(0.5);
                 }
 
-                runs.extend(split_run_for_ime_underline(
+                runs.extend(super::ime::split_run_for_ime_segments(
                     run,
                     range.clone(),
-                    ime_marked_range.clone(),
-                    marked_run.underline,
+                    &ime_split,
                 ));
             }
             runs
         } else {
-            split_run_for_ime_underline(
-                run,
-                0..display_text.len(),
-                ime_marked_range,
-                marked_run.underline,
-            )
-            .into_vec()
+            super::ime::split_run_for_ime_segments(run, 0..display_text.len(), &ime_split)
+                .into_vec()
         };
 
         let document_colors = state
@@ -2195,6 +2210,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
+            ime_dotted,
+            ime_dotted_color: text_color,
         }
     }
 
@@ -2357,11 +2374,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // Track the y-position of the cursor row for positioning the first line suffix
         let mut cursor_row_y = None;
 
-        for (line, &buffer_line) in prepaint
+        for (line_index, (line, &buffer_line)) in prepaint
             .last_layout
             .lines
             .iter()
             .zip(prepaint.last_layout.visible_buffer_lines.iter())
+            .enumerate()
         {
             let row = buffer_line;
             let line_y = origin.y + offset_y;
@@ -2379,6 +2397,20 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 window,
                 cx,
             );
+            // Modified by ibis inc.: the dotted underline of the marked text.
+            if !prepaint.ime_dotted.is_empty() {
+                if let Some(&line_start) = prepaint.last_layout.visible_line_byte_offsets.get(line_index) {
+                    line.paint_ime_dotted(
+                        p,
+                        line_height,
+                        line_start,
+                        &prepaint.ime_dotted,
+                        prepaint.ime_dotted_color,
+                        &prepaint.last_layout,
+                        window,
+                    );
+                }
+            }
             offset_y += line.size(line_height).height;
 
             if Some(row) == prepaint.current_row {
@@ -2667,6 +2699,7 @@ pub(super) fn align_runs_to_char_boundaries(text: &str, runs: &[TextRun]) -> Opt
     Some(result)
 }
 
+#[cfg(test)]
 fn split_run_for_ime_underline(
     run: TextRun,
     run_range: Range<usize>,

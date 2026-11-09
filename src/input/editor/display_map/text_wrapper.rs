@@ -3,7 +3,8 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px, size,
+    App, Bounds, Font, Hsla, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, fill,
+    point, px, size, underline_y_offset,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -815,6 +816,48 @@ impl LineLayout {
                 window,
                 cx,
             );
+        }
+    }
+
+    /// Modified by ibis inc.: paint the dotted underline (gpui cannot draw one) under `dotted` (byte ranges of the whole text with their
+    /// thickness) where it falls in this line, which starts at byte `line_start`; `pos` is where the line is painted. Dots and gaps are
+    /// as long as the line is thick, each row of a wrapped line starts a new run.
+    pub(crate) fn paint_ime_dotted(
+        &self,
+        pos: Point<Pixels>,
+        line_height: Pixels,
+        line_start: usize,
+        dotted: &[(Range<usize>, Pixels)],
+        color: Hsla,
+        last_layout: &LastLayout,
+        window: &mut Window,
+    ) {
+        let x_offset = last_layout.alignment_offset(self.longest_width);
+        let mut acc_len = 0;
+        for (ix, line) in self.wrapped_lines.iter().enumerate() {
+            let row_end = acc_len + line.len;
+            let y = pos.y + ix as f32 * line_height
+                + underline_y_offset(line_height, line.ascent, line.descent);
+            for (range, thickness) in dotted {
+                let start = range.start.saturating_sub(line_start).max(acc_len);
+                let end = range.end.saturating_sub(line_start).min(row_end);
+                if start >= end || range.end <= line_start {
+                    continue;
+                }
+                let origin_x = pos.x + x_offset + self.line_indent(ix);
+                let x0 = origin_x + line.x_for_index(start - acc_len);
+                let x1 = origin_x + line.x_for_index(end - acc_len);
+                let mut x = x0;
+                while x < x1 {
+                    let w = (*thickness).min(x1 - x);
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(w, *thickness)),
+                        color,
+                    ));
+                    x += *thickness * 2.;
+                }
+            }
+            acc_len = row_end;
         }
     }
 

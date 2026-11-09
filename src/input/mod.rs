@@ -30,6 +30,8 @@ mod editor;
 mod element;
 #[path = "editor/highlighting.rs"]
 mod highlighting;
+#[path = "base/ime.rs"]
+mod ime;
 #[path = "editor/indent.rs"]
 mod indent;
 mod input;

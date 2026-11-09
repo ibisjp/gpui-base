@@ -362,6 +362,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) selected_word_range: Option<CursorSelection>,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<CursorSelection>,
+    /// Modified by ibis inc.: how the input method underlines each clause of the marked text (see [`gpui::ImeClause`]); empty when the
+    /// platform does not say.
+    pub(super) ime_clauses: Vec<gpui::ImeClause>,
     pub(super) last_layout: Option<LastLayout>,
     pub(super) last_cursor: Option<usize>,
     /// The input container bounds
@@ -695,6 +698,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             selections: Selections::default(),
             selected_word_range: None,
             ime_marked_range: None,
+            ime_clauses: Vec::new(),
             input_bounds: Bounds::default(),
             selecting: false,
             touch_selection: Default::default(),
@@ -2760,6 +2764,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.merge_overlapping();
     }
 
+    /// Modified by ibis inc.: the lines drawn under the text being composed by an input method, as (byte range of the text, thick, line),
+    /// from the clauses the platform gave (`set_ime_clauses`); one thin solid line when it gave none; empty when nothing is being composed.
+    pub fn ime_underlines(&self) -> Vec<(Range<usize>, bool, gpui::ImeLine)> {
+        let Some(marked) = self.ime_marked_range else {
+            return Vec::new();
+        };
+        let marked_text = self.text.slice(marked.start..marked.end).to_string();
+        super::ime::ime_segments(&marked_text, &self.ime_clauses)
+            .into_iter()
+            .map(|seg| (seg.range_start + marked.start..seg.range_end + marked.start, seg.thick, seg.line))
+            .collect()
+    }
+
     /// Get byte offset of the cursor.
     ///
     /// The offset is the UTF-8 offset.
@@ -3607,6 +3624,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         self.ime_marked_range.take();
+        self.ime_clauses.clear();
         self.update_preferred_column();
         self.dismiss_touch_selection(cx);
         if self.is_multi_line() {
@@ -3698,8 +3716,22 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
+    /// Modified by ibis inc.: the lines under the clauses of the marked text, drawn by the element (see `ime.rs`).
+    fn set_ime_clauses(
+        &mut self,
+        clauses: Vec<gpui::ImeClause>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ime_marked_range.is_some() && self.ime_clauses != clauses {
+            self.ime_clauses = clauses;
+            cx.notify();
+        }
+    }
+
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.ime_marked_range = None;
+        self.ime_clauses.clear();
         self.undo_manager.commit_transaction();
     }
 
@@ -3913,6 +3945,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         M::refresh_language_features(self, window, cx);
         self.set_cursor_to(new_offset);
         self.ime_marked_range.take();
+        self.ime_clauses.clear();
         // A commit ends the IME composition: macOS delivers `insertText:` for
         // the confirmed candidate without a following `unmarkText`, so close
         // the transaction here. Leaving it open would keep merging every later
@@ -3957,6 +3990,8 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if starts_composition {
             self.undo_manager.begin_transaction();
         }
+        // The platform sends the clauses of this text right after (`set_ime_clauses`).
+        self.ime_clauses.clear();
 
         // Collapse any extra cursors so we never leave stale secondary cursors behind.
         self.selections.remove_all_but_active();
@@ -6244,6 +6279,51 @@ mod tests {
 
                 s.redo(&Redo, window, cx);
                 assert_eq!(s.value(), "你");
+            });
+        });
+    }
+
+    /// Modified by ibis inc.: the clauses the platform gives for the marked text decide the lines under it (thick, dotted, ...); with none,
+    /// one thin solid line; the clauses are gone when the composition ends or a new text is marked.
+    #[gpui::test]
+    fn test_ime_clauses_decide_the_underlines(cx: &mut TestAppContext) {
+        use gpui::{ImeClause, ImeLine};
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                assert!(s.ime_underlines().is_empty(), "nothing composed");
+                s.set_cursor_to(2);
+                // "変換中" is 3 bytes and 1 UTF-16 unit a character; it starts at byte 2.
+                s.replace_and_mark_text_in_range(None, "変換中", Some(3..3), window, cx);
+                assert_eq!(s.ime_underlines(), vec![(2..11, false, ImeLine::Solid)], "the platform said nothing");
+                s.set_ime_clauses(
+                    vec![
+                        ImeClause { range: 0..1, thick: true, line: ImeLine::Solid },
+                        ImeClause { range: 1..2, thick: false, line: ImeLine::Solid },
+                        ImeClause { range: 2..3, thick: false, line: ImeLine::Dotted },
+                    ],
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    s.ime_underlines(),
+                    vec![(2..5, true, ImeLine::Solid), (5..8, false, ImeLine::Solid), (8..11, false, ImeLine::Dotted)]
+                );
+                // A new text is marked: the old clauses do not apply to it.
+                s.replace_and_mark_text_in_range(None, "変換", Some(2..2), window, cx);
+                assert_eq!(s.ime_underlines(), vec![(2..8, false, ImeLine::Solid)]);
+                s.set_ime_clauses(vec![ImeClause { range: 0..2, thick: true, line: ImeLine::Wavy }], window, cx);
+                assert_eq!(s.ime_underlines(), vec![(2..8, true, ImeLine::Wavy)]);
+                s.replace_text_in_range(None, "返還", window, cx);
+                assert!(s.ime_underlines().is_empty(), "committed");
+                // Clauses that arrive when nothing is composed are dropped.
+                s.set_ime_clauses(vec![ImeClause { range: 0..1, thick: true, line: ImeLine::Solid }], window, cx);
+                s.replace_and_mark_text_in_range(None, "あ", Some(1..1), window, cx);
+                assert_eq!(s.ime_underlines().len(), 1);
+                assert!(!s.ime_underlines()[0].1);
             });
         });
     }
