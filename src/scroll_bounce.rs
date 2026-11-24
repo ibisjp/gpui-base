@@ -290,6 +290,7 @@ impl Element for ScrollBounce {
             let view = window.current_view();
             let on_scroll = self.on_scroll.clone();
             let axis = self.axis;
+            let displacement = self.displacement.clone();
             let extent = match axis {
                 Axis::Vertical => bounds.size.height.as_f32(),
                 Axis::Horizontal => bounds.size.width.as_f32(),
@@ -384,6 +385,10 @@ impl Element for ScrollBounce {
                 }
                 if changed {
                     state.sampled_at = Some(Instant::now());
+                    // The stretch as it is now, for whoever reads it before the next frame is laid out (ibis inc., ibisOffice K0065).
+                    if let Some(cell) = &displacement {
+                        cell.set(state.physics.offset());
+                    }
                 }
                 drop(state);
                 if changed {
