@@ -100,6 +100,8 @@ pub struct ScrollBounce {
     motion: ScrollBounceMotion,
     /// The axis the stretch is along (modified by ibis inc., ibisOffice K0065): vertical by default.
     axis: Axis,
+    /// Where the stretch shown now is written (modified by ibis inc., ibisOffice K0065), for a test or a status to read.
+    displacement: Option<Rc<std::cell::Cell<f32>>>,
     on_scroll: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -116,6 +118,7 @@ impl ScrollBounce {
             enabled: cfg!(any(target_os = "ios", target_os = "android")),
             motion: ScrollBounceMotion::default(),
             axis: Axis::Vertical,
+            displacement: None,
             on_scroll: None,
         }
     }
@@ -129,6 +132,13 @@ impl ScrollBounce {
     /// Stretch along `axis` (modified by ibis inc., ibisOffice K0065): `Axis::Horizontal` is for a viewport that scrolls sideways (a bar of buttons).
     pub fn axis(mut self, axis: Axis) -> Self {
         self.axis = axis;
+        self
+    }
+
+    /// Write the stretch shown now (pixels along the axis, positive toward the start's side) into `cell` as each frame is laid out (modified by ibis
+    /// inc., ibisOffice K0065).
+    pub fn report_displacement(mut self, cell: &Rc<std::cell::Cell<f32>>) -> Self {
+        self.displacement = Some(cell.clone());
         self
     }
 
@@ -247,6 +257,9 @@ impl Element for ScrollBounce {
             }
             state.physics.offset()
         };
+        if let Some(cell) = &self.displacement {
+            cell.set(offset);
+        }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let displaced = match self.axis {
