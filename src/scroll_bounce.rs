@@ -4,7 +4,7 @@ use crate::{OngoingScrollExt as _, ScrollbarHandle};
 use gpui::{
     AnyElement, App, Bounds, ContentMask, DispatchPhase, Element, ElementId, GlobalElementId,
     Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, OngoingScroll, Pixels,
-    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, Axis, Point,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
@@ -81,7 +81,7 @@ impl ScrollBounceMotion {
     }
 }
 
-/// Adds vertical touch overscroll to an existing scroll viewport.
+/// Adds touch overscroll (vertical, or along `axis`) to an existing scroll viewport.
 ///
 /// The child owns layout, content, and ordinary scrolling; `handle` must be the
 /// child's scroll handle. Only unused vertical deltas stretch the viewport.
@@ -98,6 +98,8 @@ pub struct ScrollBounce {
     child: AnyElement,
     enabled: bool,
     motion: ScrollBounceMotion,
+    /// The axis the stretch is along (modified by ibis inc., ibisOffice K0065): vertical by default.
+    axis: Axis,
     on_scroll: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -113,6 +115,7 @@ impl ScrollBounce {
             child: child.into_any_element(),
             enabled: cfg!(any(target_os = "ios", target_os = "android")),
             motion: ScrollBounceMotion::default(),
+            axis: Axis::Vertical,
             on_scroll: None,
         }
     }
@@ -120,6 +123,12 @@ impl ScrollBounce {
     /// Opt in on a platform with compatible touch phase semantics.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Stretch along `axis` (modified by ibis inc., ibisOffice K0065): `Axis::Horizontal` is for a viewport that scrolls sideways (a bar of buttons).
+    pub fn axis(mut self, axis: Axis) -> Self {
+        self.axis = axis;
         self
     }
 
@@ -148,8 +157,28 @@ struct State {
 /// `ScrollbarHandle` has no `max_offset`; recover it from the definition
 /// `content_size = viewport + max_offset`. Both dispatch phases clamp against
 /// this bound and must agree on it.
-fn max_scroll_extent(handle: &dyn ScrollbarHandle) -> Pixels {
-    (handle.content_size().height - handle.viewport_bounds().size.height).max(px(0.))
+fn max_scroll_extent(handle: &dyn ScrollbarHandle, axis: Axis) -> Pixels {
+    match axis {
+        Axis::Vertical => (handle.content_size().height - handle.viewport_bounds().size.height).max(px(0.)),
+        Axis::Horizontal => (handle.content_size().width - handle.viewport_bounds().size.width).max(px(0.)),
+    }
+}
+
+/// `value` of the point along `axis` (modified by ibis inc., ibisOffice K0065).
+fn along(point: Point<Pixels>, axis: Axis) -> Pixels {
+    match axis {
+        Axis::Vertical => point.y,
+        Axis::Horizontal => point.x,
+    }
+}
+
+/// `offset` with its `axis` part replaced by `value`.
+fn with_along(mut offset: Point<Pixels>, axis: Axis, value: Pixels) -> Point<Pixels> {
+    match axis {
+        Axis::Vertical => offset.y = value,
+        Axis::Horizontal => offset.x = value,
+    }
+    offset
 }
 
 #[doc(hidden)]
@@ -220,7 +249,11 @@ impl Element for ScrollBounce {
         };
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.with_element_offset(point(px(0.), px(offset)), |window| {
+            let displaced = match self.axis {
+                Axis::Vertical => point(px(0.), px(offset)),
+                Axis::Horizontal => point(px(offset), px(0.)),
+            };
+            window.with_element_offset(displaced, |window| {
                 self.child.prepaint(window, cx);
             });
         });
@@ -243,6 +276,11 @@ impl Element for ScrollBounce {
             let handle = self.handle.clone();
             let view = window.current_view();
             let on_scroll = self.on_scroll.clone();
+            let axis = self.axis;
+            let extent = match axis {
+                Axis::Vertical => bounds.size.height.as_f32(),
+                Axis::Horizontal => bounds.size.width.as_f32(),
+            };
             let mut before = 0.;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 let ScrollDelta::Pixels(mut delta) = event.delta else {
@@ -259,27 +297,31 @@ impl Element for ScrollBounce {
                 state
                     .ongoing_scroll
                     .lock_axis(&mut delta, event.touch_phase);
-                if delta.x.abs() > delta.y.abs() {
+                // The stretch is along its own axis: a swipe the other way is the child's.
+                let (main, cross) = match axis {
+                    Axis::Vertical => (delta.y, delta.x),
+                    Axis::Horizontal => (delta.x, delta.y),
+                };
+                if cross.abs() > main.abs() {
                     return;
                 }
                 let ended = matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled);
                 let mut scrolled = false;
                 let mut changed = false;
                 if phase == DispatchPhase::Capture {
-                    before = handle.offset().y.as_f32();
+                    before = along(handle.offset(), axis).as_f32();
                     if event.touch_phase == TouchPhase::Started {
-                        state.physics.begin(bounds.size.height.as_f32());
+                        state.physics.begin(extent);
                     }
                     if state.physics.suppress_momentum {
                         cx.stop_propagation();
                         return;
                     }
                     if state.physics.offset() != 0. {
-                        let remainder = state.physics.pull(delta.y.as_f32());
+                        let remainder = state.physics.pull(main.as_f32());
                         if remainder != 0. {
-                            let max = max_scroll_extent(handle.as_ref());
-                            let mut offset = handle.offset();
-                            offset.y = px(before + remainder).clamp(-max, px(0.));
+                            let max = max_scroll_extent(handle.as_ref(), axis);
+                            let offset = with_along(handle.offset(), axis, px(before + remainder).clamp(-max, px(0.)));
                             handle.set_offset(offset);
                             scrolled = true;
                         }
@@ -296,27 +338,29 @@ impl Element for ScrollBounce {
                     // prepaint. Clamp here so that boundary deltas are not
                     // mistaken for consumed scrolling (ListState clamps eagerly).
                     let mut offset = handle.offset();
-                    let max = max_scroll_extent(handle.as_ref());
-                    let clamped = offset.y.clamp(-max, px(0.));
-                    if clamped != offset.y {
-                        offset.y = clamped;
+                    let max = max_scroll_extent(handle.as_ref(), axis);
+                    let current = along(offset, axis);
+                    let clamped = current.clamp(-max, px(0.));
+                    if clamped != current {
+                        offset = with_along(offset, axis, clamped);
                         handle.set_offset(offset);
                     }
-                    let after = offset.y.as_f32();
-                    let requested = delta.y.as_f32();
+                    let here = along(offset, axis);
+                    let after = here.as_f32();
+                    let requested = main.as_f32();
                     // A List can coalesce several packets against one painted
                     // scroll position. Their offset difference alone does not
                     // prove overscroll, especially after direction changes or
                     // a zero-delta Ended packet from a trackpad.
-                    let at_outward_edge = (requested > 0. && offset.y == px(0.))
-                        || (requested < 0. && offset.y == -max);
+                    let at_outward_edge = (requested > 0. && here == px(0.))
+                        || (requested < 0. && here == -max);
                     let residual =
                         (requested - (after - before)).clamp(requested.min(0.), requested.max(0.));
                     if at_outward_edge && residual.abs() > 0.01 && !state.physics.suppress_momentum
                     {
                         let dragging = state.physics.dragging;
                         if !dragging {
-                            state.physics.begin(bounds.size.height.as_f32());
+                            state.physics.begin(extent);
                         }
                         state.physics.pull(residual);
                         if !dragging || ended {
