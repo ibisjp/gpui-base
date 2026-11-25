@@ -102,6 +102,8 @@ pub struct ScrollBounce {
     axis: Axis,
     /// Where the stretch shown now is written (modified by ibis inc., ibisOffice K0065), for a test or a status to read.
     displacement: Option<Rc<std::cell::Cell<f32>>>,
+    /// Only the scrolls of fingers stretch it (modified by ibis inc., ibisOffice K0065).
+    touch_only: bool,
     on_scroll: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -119,6 +121,7 @@ impl ScrollBounce {
             motion: ScrollBounceMotion::default(),
             axis: Axis::Vertical,
             displacement: None,
+            touch_only: false,
             on_scroll: None,
         }
     }
@@ -132,6 +135,13 @@ impl ScrollBounce {
     /// Stretch along `axis` (modified by ibis inc., ibisOffice K0065): `Axis::Horizontal` is for a viewport that scrolls sideways (a bar of buttons).
     pub fn axis(mut self, axis: Axis) -> Self {
         self.axis = axis;
+        self
+    }
+
+    /// Stretch only for the scrolls fingers make (`ScrollWheelEvent::touch_fingers` not 0): a wheel and a trackpad are clamped at the end as before (modified by
+    /// ibis inc., ibisOffice K0065). The listener is there whatever the device was before its first touch.
+    pub fn touch_only(mut self) -> Self {
+        self.touch_only = true;
         self
     }
 
@@ -290,6 +300,7 @@ impl Element for ScrollBounce {
             let view = window.current_view();
             let on_scroll = self.on_scroll.clone();
             let axis = self.axis;
+            let touch_only = self.touch_only;
             let displacement = self.displacement.clone();
             let extent = match axis {
                 Axis::Vertical => bounds.size.height.as_f32(),
@@ -301,6 +312,10 @@ impl Element for ScrollBounce {
                     return;
                 };
                 if !hitbox.should_handle_scroll(window) {
+                    return;
+                }
+                // Only what fingers make (ibis inc., ibisOffice K0065): a wheel or a trackpad has no stretch.
+                if touch_only && event.touch_fingers == 0 {
                     return;
                 }
                 let mut state = state.borrow_mut();
