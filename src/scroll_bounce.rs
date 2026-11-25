@@ -257,7 +257,8 @@ impl Element for ScrollBounce {
                 *state = State::default();
             }
             state.physics.motion = self.motion;
-            let now = Instant::now();
+            // The executor's clock (a test's fake clock moves it; ibis inc., ibisOffice K0065).
+            let now = cx.background_executor().now();
             let elapsed = state
                 .sampled_at
                 .replace(now)
@@ -399,7 +400,7 @@ impl Element for ScrollBounce {
                     }
                 }
                 if changed {
-                    state.sampled_at = Some(Instant::now());
+                    state.sampled_at = Some(cx.background_executor().now());
                     // The stretch as it is now, for whoever reads it before the next frame is laid out (ibis inc., ibisOffice K0065).
                     if let Some(cell) = &displacement {
                         cell.set(state.physics.offset());
